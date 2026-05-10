@@ -163,7 +163,7 @@ ALL_STRUCTURED_SCHEMAS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 DUPLICATE_SIMILARITY_THRESHOLD = 0.75
-MID_LOOP_TASK_CEILING = 15
+MID_LOOP_TASK_CEILING = 20
 VALID_RECOMMENDATIONS = ("CONTINUE", "COURSE_CORRECT", "DESCOPE", "SHIP_READY")
 COMPLETE_STATUSES = ("done", "descoped")
 
