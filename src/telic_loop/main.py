@@ -510,11 +510,15 @@ def _run_iteration(
         progress = handler(config, state, agent)
 
     except RateLimitError as rle:
-        wait_secs = parse_rate_limit_wait_seconds(rle)
-        print(f"\n  RATE LIMIT HIT — sleeping {wait_secs // 60}m...")
-        state.save(config.state_file)
-        time.sleep(wait_secs)
-        return False  # continue loop
+        # Persist the pause signal to .loop_state.json so the outer driver
+        # can pick it up via the state file even if the re-raised exception
+        # gets wrapped on the way out. Commit partial work to the sprint
+        # branch so resume picks up cleanly. Then re-raise — the outer
+        # loop catches RateLimitError, converts to QuotaExceededError, and
+        # pauses the project durably (instead of the old in-process sleep
+        # which blocks the driver and prevents operator-driven early resume).
+        _record_quota_pause(config, state, rle)
+        raise
 
     except Exception as exc:
         crash_record = _log_iteration_crash(config, state, phase, exc, iteration)
@@ -564,6 +568,11 @@ def run_loop(config: LoopConfig, state: LoopState, agent: Agent) -> None:
         print("  TELIC LOOP V4")
         print("=" * 60)
 
+        # Clear any stale quota-pause signal from a prior interrupted run.
+        # If we're entering run_loop, the pause has been handled (either by
+        # the auto-wake timer in the watchdog or by `telic-project resume`).
+        _clear_quota_pause_signal(state)
+
         start_iter = max(state.iteration + 1, 1)
         for iteration in range(start_iter, start_iter + config.max_iterations):
             state.iteration = iteration
@@ -591,6 +600,71 @@ def run_loop(config: LoopConfig, state: LoopState, agent: Agent) -> None:
 
     finally:
         _release_lock(lock_path)
+
+
+def _record_quota_pause(
+    config: LoopConfig, state: LoopState, rle: "RateLimitError",
+) -> None:
+    """Persist a quota-pause signal to .loop_state.json + commit partial work.
+
+    Called when the inner loop's agent call hits an Anthropic rate limit /
+    quota error. Writes the signal so the outer telic-project driver can
+    convert it into a QuotaExceededError after the inner loop re-raises.
+
+    Crucially does NOT:
+      - log to .crash_log.jsonl (quota isn't a crash, it's environmental)
+      - increment phase_crash_counts (would trip the per-phase crash budget)
+      - increment state.iteration (no progress was made this iteration)
+    """
+    from datetime import datetime, timedelta
+
+    from .git import git_commit
+
+    # Compute reset_at from the existing parser, which already understands
+    # "resets 9pm" / "resets at 21:30" patterns. Cap is enforced inside.
+    wait_secs = parse_rate_limit_wait_seconds(rle)
+    reset_at = datetime.now() + timedelta(seconds=wait_secs)
+
+    # Categorise — for now we treat all RateLimitError as 'quota'; future
+    # SDK error shapes (overloaded / 429 with retry-after) can map to
+    # 'rate_limit' / 'overloaded' here.
+    text = str(rle)
+    state.crash_kind = "quota_exceeded"
+    state.crash_signature_kind = "quota"
+    state.quota_reset_at = reset_at.isoformat(timespec="seconds")
+    state.crash_source_text = text[:1000]
+
+    print(f"\n  API quota exhausted — pausing inner loop. "
+          f"Reset at {state.quota_reset_at}.")
+
+    state.save(config.state_file)
+
+    # Commit any partial in-progress work on the sprint branch so resume
+    # picks up cleanly. Best-effort — if there's nothing to commit (clean
+    # tree) git_commit handles it.
+    try:
+        git_commit(
+            config, state,
+            f"telic-loop({config.sprint}): paused on api quota",
+        )
+    except Exception:
+        # Don't let a commit failure mask the original quota signal.
+        pass
+
+
+def _clear_quota_pause_signal(state: LoopState) -> None:
+    """Clear stale quota-pause fields at the start of a fresh inner-loop run.
+
+    Once the inner loop is running again, by definition the prior pause has
+    been handled (either by reset-time auto-wake or operator-driven resume).
+    Clear the fields so a successful completion's .loop_state.json doesn't
+    carry a misleading signal that the outer loop could mis-interpret.
+    """
+    if state.crash_kind == "quota_exceeded":
+        state.crash_kind = ""
+        state.crash_signature_kind = ""
+        state.quota_reset_at = ""
+        state.crash_source_text = ""
 
 
 def _log_iteration_crash(

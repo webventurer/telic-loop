@@ -211,6 +211,17 @@ class LoopState:
     # Builder exit request flag
     exit_requested: bool = False
 
+    # Quota / rate-limit pause signal — populated when the inner loop exits
+    # cleanly because the Anthropic API is exhausted. Outer loop reads these
+    # to convert the inner-loop exit into a typed QuotaExceededError without
+    # needing to reparse the SDK error text. crash_kind="quota_exceeded" is
+    # the only value used today; the field is kept generic for future
+    # categories.
+    crash_kind: str = ""
+    crash_signature_kind: str = ""  # "quota" / "rate_limit" / "overloaded"
+    quota_reset_at: str = ""  # ISO timestamp; empty means "use default"
+    crash_source_text: str = ""  # short SDK error excerpt, capped on write
+
     # ----- Properties -----
 
     @property
